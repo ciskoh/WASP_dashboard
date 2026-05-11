@@ -1,0 +1,10 @@
+data/*
+*.pyc
+*/*.pyc
+**/__pycache__/
+.pytest_cache/
+*.env
+.env
+src/api_hooks/.env
+notebooks/.ipynb_checkpoints/
+
