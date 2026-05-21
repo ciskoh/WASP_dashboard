@@ -5,6 +5,7 @@ from typing import List
 
 import toml
 import shapely as shap
+import xarray as xr
 
 
 def bbox(location: dict, buffer: float = 0.5) -> tuple[float, float, float, float]:
@@ -115,3 +116,28 @@ class Context:
             f"location: {self.location}, "
             f"folders: [temp] {self.temp_folder}, [processed] {self.local_folder}"
         )
+
+
+def date_range(start_time: str, end_time: str):
+    """Yield ISO date strings (YYYY-MM-DD) from start_time to end_time inclusive."""
+    from datetime import datetime, timedelta
+    current = datetime.strptime(start_time, "%Y-%m-%d")
+    end = datetime.strptime(end_time, "%Y-%m-%d")
+    while current <= end:
+        yield current.strftime("%Y-%m-%d")
+        current += timedelta(days=1)
+
+
+def open_ds(raw: str | p.Path | xr.Dataset) -> xr.Dataset:
+    """Return an xr.Dataset from either a file path or an existing Dataset.
+
+    Raises TypeError if *raw* is neither.
+    """
+    if isinstance(raw, xr.Dataset):
+        return raw
+    try:
+        return xr.open_dataset(raw)
+    except Exception as exc:
+        raise TypeError(
+            f"Expected a file path or xr.Dataset, got {type(raw).__name__!r}"
+        ) from exc
