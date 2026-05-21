@@ -97,30 +97,59 @@ pytest tests/ -m "not integration"
 pytest tests/ -m integration -v
 ```
 
-## Fetching precipitation data
+## api_hooks — precipitation data sources
+
+### Configuration
+
+All fetchers read location, time range, and output folders from `src/api_hooks/settings.toml`:
+
+```toml
+[context]
+st_date      = "2025-02-01"
+en_date      = "2025-02-28"
+location     = [-105.0885872, 30.8128463]   # [lon, lat]
+temp_folder  = "data/raw/weather/temp"       # raw downloads
+local_folder = "data/raw/weather/processed" # processed output
+```
+
+### Public API
 
 ```python
 from src.api_hooks import get_precipitation, list_sources
 
-# Show available sources
-list_sources()
+list_sources()   # returns a polars DataFrame of available sources
 
-# Fetch daily precipitation for a point location
 ds = get_precipitation(
-    data_source_id="10",          # 2=TexMesonet, 5=IMERG, 7=PRISM, 10=ERA5
+    data_source_id="7",           # 2=TexMesonet, 5=IMERG, 7=PRISM, 10=ERA5
     start_time="2024-06-01",
     end_time="2024-06-07",
     location_poly_or_point={"type": "Point", "coordinates": [-103.5, 30.5]},
 )
-# Returns xr.Dataset with variable precip_mm (time, lat, lon), units mm/day
+# ds["total_precipitation"], units mm
 ```
 
-### Known API limitations
+### Per-source fetch/process API
 
-| Source | Limitation |
-|--------|-----------|
-| ERA5 | CDS API v2 delivers data as a ZIP file containing a NetCDF4 |
-| IMERG | v07 product: flat HDF5 structure (no `Grid` group), precipitation already in mm/day |
-| PRISM | Rate-limited to 2 downloads per file per day (Pacific time) |
-| TexMesonet | Synoptic free tier: ~1 year of history; token required (free account) |
+Each source exposes `fetch_*` and `process_*` functions that accept a `Context` object and a settings dict. All processed outputs use variable `total_precipitation`, units `mm`.
 
+```python
+from src.api_hooks._utils import Context
+from src.api_hooks._era5 import fetch_era5, process_era5
+from src.api_hooks._gpm_imerg import fetch_imerg, process_imerg
+from src.api_hooks._prism import fetch_prism, process_prism
+from src.api_hooks._texmesonet import fetch_texmesonet, process_texmesonet
+
+ctx = Context("src/api_hooks/settings.toml")
+
+raw = fetch_prism(ctx, save_raw=True)       # saves to ctx.temp_folder
+ds  = process_prism(raw, ctx, save_processed=False)
+```
+
+### Known source limitations
+
+| Source | Notes |
+|--------|-------|
+| ERA5 | Anonymous access via ARCO GCS Zarr store; hourly data resampled to daily |
+| IMERG | v07 flat HDF5; requires NASA Earthdata credentials in `.env`; `earthaccess` optional dep |
+| PRISM | Rate-limited (~2 req/file/day Pacific time); no credentials needed |
+| TexMesonet | Synoptic free tier: ~1 year history; `TEXMESONET_API_KEY` required in `.env` |
