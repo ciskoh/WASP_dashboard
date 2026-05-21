@@ -1,100 +1,139 @@
-"""
-ERA5-Land daily precipitation fetcher via the ECMWF CDS API.
+"""ERA5-Land hourly precipitation fetcher and processor via ARCO Google Cloud Storage."""
 
-Credentials are read from environment variables CDSAPI_URL and CDSAPI_KEY,
-which should be set in a .env file at the project root.
+import pathlib as p
 
-Output convention: xr.Dataset with variable 'precip_mm' (time, lat, lon),
-units mm/day, covering the requested date range and bounding box.
-"""
-
-import os
-import tempfile
-import zipfile
-from datetime import datetime, timedelta
-from pathlib import Path
-
-import pandas as pd
 import xarray as xr
-from dotenv import load_dotenv
 
-from src.api_hooks._utils import bbox
+from ._utils import Context
 
-_ENV_FILE = Path(__file__).parent / ".env"
+ERA5_SETTINGS = {
+    "data_source": "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3",
+    "chunks": 48,
+    "variables": ["total_precipitation"],
+    "resample": "1D",
+    "out_units": {
+        "total_precipitation": {
+            "units_from": "m",
+            "units_to": "mm",
+            "conversion": lambda x: x * 1000,
+        }
+    },
+}
 
 
-def _date_range(start_time: str, end_time: str):
-    """Yield datetime objects from start_time to end_time inclusive."""
-    current = datetime.strptime(start_time, "%Y-%m-%d")
-    end = datetime.strptime(end_time, "%Y-%m-%d")
-    while current <= end:
-        yield current
-        current += timedelta(days=1)
+def fetch_era5(context: Context, settings: dict = ERA5_SETTINGS, save_temp: bool = True):
+    """Fetch ERA5-Land hourly precipitation for the location and time range in *context*.
 
-
-def _fetch_era5(start_time: str, end_time: str, location: dict) -> xr.Dataset:
-    """
-    Fetch ERA5-Land daily precipitation sum for a location and date range.
+    Downloads data from the ARCO public Zarr store on GCS (anonymous access).
+    ARCO stores longitude in 0–360°, so negative (western) longitudes are
+    converted before the spatial selection.
 
     Parameters
     ----------
-    start_time : str  ISO date, e.g. "2024-01-01"
-    end_time   : str  ISO date, e.g. "2024-01-03"
-    location   : dict GeoJSON Point or Polygon
+    context:
+        Runtime context carrying location, time_frame, and folder paths.
+    settings:
+        Source-specific settings dict; defaults to ERA5_SETTINGS.
+    save_temp:
+        If True, write the raw subset to a NetCDF file in context.temp_folder
+        and return its path. If False, return the xr.Dataset directly.
 
     Returns
     -------
-    xr.Dataset with variable precip_mm (time, lat, lon), units mm/day
+    pathlib.Path | xr.Dataset
     """
-    import cdsapi  # deferred: optional dependency
-
-    load_dotenv(_ENV_FILE)
-
-    dates = list(_date_range(start_time, end_time))
-    years  = sorted({d.strftime("%Y") for d in dates})
-    months = sorted({d.strftime("%m") for d in dates})
-    days   = sorted({d.strftime("%d") for d in dates})
-
-    client = cdsapi.Client(
-        url=os.environ["ERA5_CDSAPI_URL"],
-        key=os.environ["ERA5_CDSAPI_KEY"],
-        quiet=True,
+    ds = xr.open_zarr(
+        settings["data_source"],
+        chunks={"time": settings["chunks"]},
+        storage_options={"token": "anon"},
     )
 
-    w, s, e, n = bbox(location)
+    # ARCO longitude is 0–360, so convert negative (western) longitudes.
+    lat = context.location.y
+    lon = context.location.x % 360
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, "era5.zip")
-        client.retrieve(
-            "reanalysis-era5-land",
-            {
-                "variable": "total_precipitation",
-                "year": years,
-                "month": months,
-                "day": days,
-                "time": [f"{h:02d}:00" for h in range(24)],
-                "area": [n, w, s, e],  # CDS format: [N, W, S, E]
-                "data_format": "netcdf",
-            },
-            zip_path,
+    sub = (
+        ds[settings["variables"]]
+        .sel(latitude=lat, longitude=lon, method="nearest")
+        .sel(time=slice(*context.time_frame))
+    )
+
+    if save_temp:
+        out_path = (
+            p.Path(context.temp_folder)
+            / f"era5_{context.time_frame[0]}-{context.time_frame[1]}.nc"
         )
-        with zipfile.ZipFile(zip_path) as zf:
-            nc_name = next(n for n in zf.namelist() if n.endswith(".nc"))
-            zf.extract(nc_name, tmpdir)
-        tmp_path = os.path.join(tmpdir, nc_name)
-        with xr.open_dataset(tmp_path, engine="h5netcdf") as raw:
-            tp = raw["tp"]
-            time_dim = "valid_time" if "valid_time" in tp.dims else "time"
-            # tp is metres/hour; daily sum × 1000 → mm/day
-            daily_mm = (tp.resample({time_dim: "1D"}).sum() * 1000.0).load()
+        sub.to_netcdf(out_path)
+        return out_path
 
-    daily_mm = daily_mm.rename({time_dim: "time", "latitude": "lat", "longitude": "lon"})
+    return sub.to_dataset()
 
-    # CDS may return extra days at month boundaries — keep only what was requested
-    requested = pd.DatetimeIndex([d.strftime("%Y-%m-%d") for d in dates])
-    time_index = pd.DatetimeIndex(daily_mm.time.values).normalize()
-    daily_mm = daily_mm.isel(time=time_index.isin(requested))
 
-    ds = xr.Dataset({"precip_mm": daily_mm})
-    ds["precip_mm"].attrs["units"] = "mm/day"
-    return ds
+def process_era5(
+    raw_era5: str | xr.Dataset,
+    context: Context,
+    settings: dict = ERA5_SETTINGS,
+    save_processed: bool = True,
+):
+    """Resample hourly ERA5 precipitation to daily totals and convert units.
+
+    Hourly ``total_precipitation`` in ERA5 is a per-hour accumulation in metres.
+    Daily totals are computed by summing the 24 hourly values for each UTC day,
+    then converted to the target units defined in ``settings["out_units"]``.
+
+    Parameters
+    ----------
+    raw_era5:
+        Path to a NetCDF file produced by :func:`fetch_era5`, or an
+        xr.Dataset already loaded in memory.
+    context:
+        Runtime context carrying time_frame and folder paths.
+    settings:
+        Source-specific settings dict; defaults to ERA5_SETTINGS.
+    save_processed:
+        If True, write the processed dataset to context.local_folder and
+        return its path. If False, return the xr.Dataset directly.
+
+    Returns
+    -------
+    pathlib.Path | xr.Dataset
+
+    Raises
+    ------
+    AssertionError
+        If *raw_era5* is neither a valid file path nor an xr.Dataset.
+    NotImplementedError
+        If a required unit conversion is not defined in *settings*.
+    """
+    try:
+        raw_era5 = xr.open_dataset(raw_era5)
+    except TypeError:
+        assert isinstance(raw_era5, xr.Dataset), (
+            "raw_era5 must be a path to a NetCDF file or an xr.Dataset"
+        )
+
+    daily = raw_era5[settings["variables"]].resample(time=settings["resample"]).sum()
+
+    for var, unit_spec in settings["out_units"].items():
+        if var not in daily.data_vars:
+            continue
+        current_units = daily[var].attrs.get("units")
+        if current_units == unit_spec["units_to"]:
+            continue
+        if current_units == unit_spec["units_from"]:
+            daily[var] = unit_spec["conversion"](daily[var])
+            daily[var].attrs["units"] = unit_spec["units_to"]
+        else:
+            raise NotImplementedError(
+                f"No conversion defined from {current_units!r} to {unit_spec['units_to']!r}"
+            )
+
+    if save_processed:
+        out_path = (
+            p.Path(context.local_folder)
+            / f"era5_processed_{context.time_frame[0]}-{context.time_frame[1]}.nc"
+        )
+        daily.to_netcdf(out_path)
+        return out_path
+
+    return daily
