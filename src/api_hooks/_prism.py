@@ -1,40 +1,40 @@
 """
-PRISM daily precipitation fetcher (4 km gridded, public HTTP).
+PRISM daily precipitation fetcher and processor (4 km gridded, public HTTP).
 
 No credentials required. Historical data available from 1895; provisional
 data available 1-3 days after the observation date.
 
 Downloads one ZIP per requested day from the PRISM Climate Group service,
-reads the BIL raster with rasterio, clips to the requested bounding box,
-and returns daily precipitation in mm. Days are fetched in parallel.
+reads the GeoTIFF raster with rasterio, clips to the bounding box from the
+runtime Context, and returns daily precipitation. Days are fetched in parallel.
 
-Output convention: xr.Dataset with variable 'precip_mm' (time, lat, lon),
-units mm/day.
+Typical usage
+-------------
+    context = Context("src/api_hooks/settings.toml")
+    raw_path = fetch_prism(context, save_raw=True)
+    ds = process_prism(raw_path, context, save_processed=False)
 """
 
 import io
+import pathlib as p
 import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
-from pathlib import Path
 
 import numpy as np
 import requests
 import xarray as xr
 
-from src.api_hooks._utils import bbox
+from src.api_hooks._utils import Context, date_range, open_ds
 
-_PRISM_URL = "https://services.nacse.org/prism/data/get/us/4km/ppt/{date}"
+PRISM_SETTINGS = {
+    "url": "https://services.nacse.org/prism/data/get/us/4km/ppt/{date}",
+    "variable": "precip_raw",
+    "out_variable": "total_precipitation",
+    "units": "mm",
+    "max_workers": 4,
+}
 
-
-def _date_range(start_time: str, end_time: str):
-    """Yield (YYYYMMDD, YYYY-MM-DD) pairs from start_time to end_time inclusive."""
-    current = datetime.strptime(start_time, "%Y-%m-%d")
-    end = datetime.strptime(end_time, "%Y-%m-%d")
-    while current <= end:
-        yield current.strftime("%Y%m%d"), current.strftime("%Y-%m-%d")
-        current += timedelta(days=1)
 
 
 def _fetch_day(
@@ -43,26 +43,28 @@ def _fetch_day(
     south: float,
     east: float,
     north: float,
+    url_template: str,
 ) -> xr.DataArray:
-    """Download and parse one day's PRISM precipitation GeoTIFF raster."""
+    """Download and clip one day's PRISM precipitation GeoTIFF from a ZIP archive."""
     import rasterio
     from rasterio.windows import from_bounds
 
-    url = _PRISM_URL.format(date=date_yyyymmdd)
+    url = url_template.format(date=date_yyyymmdd)
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
+    raw = resp.content
 
-    if not resp.content[:4] == b"PK\x03\x04":
+    if raw[:4] != b"PK\x03\x04":
         raise RuntimeError(
             f"PRISM returned a non-ZIP response for {date_yyyymmdd} "
             f"(likely rate-limited): {resp.text[:300]}"
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             zf.extractall(tmpdir)
 
-        tif_files = list(Path(tmpdir).glob("*.tif"))
+        tif_files = list(p.Path(tmpdir).glob("*.tif"))
         if not tif_files:
             raise FileNotFoundError(f"No .tif file in PRISM ZIP for {date_yyyymmdd}")
 
@@ -78,32 +80,97 @@ def _fetch_day(
     return xr.DataArray(data, dims=["lat", "lon"], coords={"lat": lats, "lon": lons})
 
 
-def _fetch_prism(start_time: str, end_time: str, location: dict) -> xr.Dataset:
-    """
-    Fetch PRISM daily precipitation for a location and date range.
+def fetch_prism(
+    context: Context,
+    settings: dict = PRISM_SETTINGS,
+    save_raw: bool = True,
+) -> p.Path | xr.Dataset:
+    """Fetch PRISM daily precipitation for the location and time range in *context*.
+
+    Downloads one ZIP per day in parallel, clips each raster to the bounding
+    box, and concatenates the results along the time dimension.
 
     Parameters
     ----------
-    start_time : str  ISO date, e.g. "2024-01-01"
-    end_time   : str  ISO date, e.g. "2024-01-03"
-    location   : dict GeoJSON Point or Polygon
+    context:
+        Runtime context carrying location, time_frame, and folder paths.
+    settings:
+        Source-specific settings dict; defaults to PRISM_SETTINGS.
+    save_raw:
+        If True, write the combined dataset to a NetCDF file in
+        context.temp_folder and return its path. If False, return the
+        xr.Dataset directly.
 
     Returns
     -------
-    xr.Dataset with variable precip_mm (time, lat, lon), units mm/day
+    pathlib.Path | xr.Dataset
     """
-    w, s, e, n = bbox(location, buffer=0.1)
-    date_pairs = list(_date_range(start_time, end_time))
+    w, s, e, n = context.location_buffer.bounds
+    dates = list(date_range(*context.time_frame))
 
-    def fetch_day(pair):
-        date_compact, date_iso = pair
-        da = _fetch_day(date_compact, w, s, e, n)
+    def fetch_day(date_iso):
+        da = _fetch_day(date_iso.replace("-", ""), w, s, e, n, settings["url"])
         return da.expand_dims({"time": [np.datetime64(date_iso)]})
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        arrays = list(pool.map(fetch_day, date_pairs))
+    with ThreadPoolExecutor(max_workers=settings["max_workers"]) as pool:
+        arrays = list(pool.map(fetch_day, dates))
 
     combined = xr.concat(arrays, dim="time")
-    ds = xr.Dataset({"precip_mm": combined})
-    ds["precip_mm"].attrs["units"] = "mm/day"
+    ds = xr.Dataset({settings["variable"]: combined})
+
+    if save_raw:
+        out_path = (
+            p.Path(context.temp_folder)
+            / f"prism_raw_{context.time_frame[0]}-{context.time_frame[1]}.nc"
+        )
+        ds.to_netcdf(out_path)
+        ds.close()
+        return out_path
+
+    return ds
+
+
+def process_prism(
+    raw_prism: str | xr.Dataset,
+    context: Context,
+    settings: dict = PRISM_SETTINGS,
+    save_processed: bool = True,
+) -> p.Path | xr.Dataset:
+    """Rename the precipitation variable and annotate units.
+
+    Parameters
+    ----------
+    raw_prism:
+        Path to a NetCDF file produced by :func:`fetch_prism`, or an
+        xr.Dataset already in memory.
+    context:
+        Runtime context carrying time_frame and folder paths.
+    settings:
+        Source-specific settings dict; defaults to PRISM_SETTINGS.
+    save_processed:
+        If True, write the processed dataset to context.local_folder and
+        return its path. If False, return the xr.Dataset directly.
+
+    Returns
+    -------
+    pathlib.Path | xr.Dataset
+
+    Raises
+    ------
+    TypeError
+        If *raw_prism* is neither a file path nor an xr.Dataset.
+    """
+    ds = open_ds(raw_prism)
+    ds = ds.rename({settings["variable"]: settings["out_variable"]})
+    ds[settings["out_variable"]].attrs["units"] = settings["units"]
+
+    if save_processed:
+        out_path = (
+            p.Path(context.local_folder)
+            / f"prism_processed_{context.time_frame[0]}-{context.time_frame[1]}.nc"
+        )
+        ds.to_netcdf(out_path)
+        ds.close()
+        return out_path
+
     return ds
