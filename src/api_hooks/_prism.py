@@ -84,6 +84,7 @@ def fetch_prism(
     context: Context,
     settings: dict = PRISM_SETTINGS,
     save_raw: bool = True,
+    use_cache: bool = False,
 ) -> p.Path | xr.Dataset:
     """Fetch PRISM daily precipitation for the location and time range in *context*.
 
@@ -100,11 +101,22 @@ def fetch_prism(
         If True, write the combined dataset to a NetCDF file in
         context.temp_folder and return its path. If False, return the
         xr.Dataset directly.
+    use_cache:
+        If True and the output NetCDF already exists on disk, return it
+        without re-downloading. Useful when PRISM's 2-downloads-per-day
+        rate limit has already been reached.
 
     Returns
     -------
     pathlib.Path | xr.Dataset
     """
+    out_path = (
+        p.Path(context.temp_folder)
+        / f"prism_raw_{context.time_frame[0]}-{context.time_frame[1]}.nc"
+    )
+    if use_cache and out_path.exists():
+        return out_path if save_raw else xr.open_dataset(out_path)
+
     w, s, e, n = context.location_buffer.bounds
     dates = list(date_range(*context.time_frame))
 

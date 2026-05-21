@@ -33,13 +33,13 @@ from src.api_hooks._utils import Context, date_range, open_ds
 TEXMESONET_SETTINGS = {
     "url": "https://api.synopticdata.com/v2/stations/timeseries",
     "token_env_var": "TEXMESONET_API_KEY",
-    "fallback_radius": 500,
+    "fallback_radius": 200,
     "variable": "precip_raw",
     "out_variable": "total_precipitation",
     "units": "mm",
 }
 
-_ENV_FILE = Path(__file__).parent / ".env"
+_ENV_FILE = Path(__file__).parent.parent.parent / ".env"
 
 
 def _query_synoptic(url: str, token: str, extra_params: dict, start: str, end: str) -> list:

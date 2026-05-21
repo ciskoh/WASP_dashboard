@@ -18,10 +18,14 @@ Typical usage
 import pathlib as p
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 
 import xarray as xr
+from dotenv import load_dotenv
 
 from src.api_hooks._utils import Context, open_ds
+
+_ENV_FILE = Path(__file__).parent.parent.parent / ".env"
 
 IMERG_SETTINGS = {
     "strategy": "environment",
@@ -87,6 +91,7 @@ def fetch_imerg(
     pathlib.Path | xr.Dataset
     """
     import earthaccess  # optional dependency, deferred to avoid hard import at module load
+    load_dotenv(_ENV_FILE)
     earthaccess.login(strategy=settings["strategy"])
     w, s, e, n = context.location_buffer.bounds
 

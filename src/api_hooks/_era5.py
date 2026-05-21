@@ -4,7 +4,7 @@ import pathlib as p
 
 import xarray as xr
 
-from ._utils import Context
+from ._utils import Context, open_ds
 
 ERA5_SETTINGS = {
     "data_source": "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3",
@@ -66,7 +66,7 @@ def fetch_era5(context: Context, settings: dict = ERA5_SETTINGS, save_temp: bool
         sub.to_netcdf(out_path)
         return out_path
 
-    return sub.to_dataset()
+    return sub
 
 
 def process_era5(
@@ -105,13 +105,7 @@ def process_era5(
     NotImplementedError
         If a required unit conversion is not defined in *settings*.
     """
-    try:
-        raw_era5 = xr.open_dataset(raw_era5)
-    except TypeError:
-        assert isinstance(raw_era5, xr.Dataset), (
-            "raw_era5 must be a path to a NetCDF file or an xr.Dataset"
-        )
-
+    raw_era5 = open_ds(raw_era5)
     daily = raw_era5[settings["variables"]].resample(time=settings["resample"]).sum()
 
     for var, unit_spec in settings["out_units"].items():
