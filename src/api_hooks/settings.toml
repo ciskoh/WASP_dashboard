@@ -1,0 +1,9 @@
+[context]
+
+st_date= "2025-02-01"
+en_date= "2025-02-28"
+
+location = [-105.0885872, 30.8128463]
+
+temp_folder = "data/raw/weather/temp"
+local_folder= "data/raw/weather/processed"
