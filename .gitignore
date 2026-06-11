@@ -8,3 +8,8 @@ data/*
 src/api_hooks/.env
 notebooks/.ipynb_checkpoints/
 
+*/*.claude
+.claude/*
+
+*/*.vscode
+.vscode/*
