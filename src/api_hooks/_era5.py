@@ -49,12 +49,12 @@ def fetch_era5(context: Context, settings: dict = ERA5_SETTINGS, save_temp: bool
     )
 
     # ARCO longitude is 0–360, so convert negative (western) longitudes.
-    lat = context.location.y
-    lon = context.location.x % 360
+    w, s, e, n = context.location_buffer.bounds
+    w_360, e_360 = w % 360, e % 360
 
     sub = (
         ds[settings["variables"]]
-        .sel(latitude=lat, longitude=lon, method="nearest")
+        .sel(latitude=slice(n, s), longitude=slice(w_360, e_360))
         .sel(time=slice(*context.time_frame))
     )
 
